@@ -1,0 +1,31 @@
+# OPT-IN: more than one API pod. Read docs/DEPLOYMENT.md → "Scaling out" and finish its checklist
+# first; several subsystems are per-process and only become safe with sticky routing + shared state.
+#
+# Adds: an HPA (2–6 pods), a PodDisruptionBudget, and a second Ingress that pins every WebSocket of a
+# live session (or of an event board) to one pod by hashing the request path.
+#
+#   components:
+#     - ../../components/scale-out
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - hpa.yaml
+  - pdb.yaml
+  - ingress-ws-affinity.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: evently-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+  - target:
+      kind: Ingress
+      name: evently-api
+    patch: |-
+      - op: add
+        path: /metadata/annotations/evently.dev~1routing
+        value: "round-robin for REST; /ws/* is served by the evently-ws Ingress (path-hash affinity)"

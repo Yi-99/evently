@@ -1,0 +1,43 @@
+# Non-secret settings for the API (every key maps 1:1 onto app/core/config.py Settings).
+# Overlays patch DATABASE_URL, ELASTICSEARCH_URL, ENVIRONMENT and the OTel endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: evently-api-config
+data:
+  ENVIRONMENT: production
+  # Redis event bus: required as soon as there is more than one API pod, cheap with one, and it
+  # keeps envelope history across restarts. Points at the in-cluster Redis from redis.yaml.
+  REDIS_URL: redis://evently-redis:6379/0
+  BUS_HISTORY_SIZE: "500"
+  MAX_PARALLEL_AGENTS: "6"
+  AUDIO_MAX_LISTENERS_PER_SESSION: "500"
+  CORS_ORIGINS: '["https://app.evently.example"]'
+  PLACES_PROVIDER: auto
+  WEATHER_PROVIDER: auto
+  TRAFFIC_PROVIDER: auto
+  STT_PROVIDER: auto
+  # --- LLM ----------------------------------------------------------------------------------
+  # anthropic (needs ANTHROPIC_API_KEY) or openai (needs OPENAI_API_KEY). Overrides route single purposes,
+  # e.g. "orchestrator=openai,presentations=openai" (purposes listed in .env.example). The Secret is
+  # loaded after this ConfigMap, so the dev Secret built from .env overrides these.
+  LLM_PROVIDER: anthropic
+  LLM_PROVIDER_OVERRIDES: ""
+  # On billing/credential failures (e.g. Claude out of credits) retry on the other configured provider.
+  LLM_FALLBACK: auto
+  LLM_FALLBACK_COOLDOWN_S: "600"
+  OPENAI_ORCHESTRATOR_MODEL: gpt-6-astra
+  OPENAI_WORKER_MODEL: gpt-6-astra
+  EMAIL_PROVIDER: auto
+  # --- observability (OpenTelemetry → Dash0) --------------------------------------------------
+  OTEL_ENABLED: "true"
+  OTEL_SERVICE_NAME: evently-api
+  # Direct export to Dash0's OTLP/gRPC ingress. The auth header lives in the Secret
+  # (OTEL_EXPORTER_OTLP_HEADERS). To go through a collector instead, point this at it and drop the header.
+  OTEL_EXPORTER_OTLP_ENDPOINT: https://ingress.eu-west-1.aws.dash0.com:4317
+  DASH0_DATASET: default
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "1.0"
+  OTEL_METRIC_EXPORT_INTERVAL: "30000"
+  # --- search -------------------------------------------------------------------------------
+  ELASTICSEARCH_INDEX_PREFIX: evently

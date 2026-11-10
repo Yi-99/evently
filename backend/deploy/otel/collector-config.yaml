@@ -1,0 +1,71 @@
+# OpenTelemetry Collector (contrib) config used by docker-compose and by the optional in-cluster
+# collector. The API exports OTLP/gRPC to this collector; the collector forwards to Dash0.
+#
+# Environment variables (set in `.env` for compose, in a Secret for Kubernetes):
+#   DASH0_ENDPOINT    ingress.<region>.<cloud>.dash0.com:4317   (Dash0 → Organization settings → Endpoints)
+#   DASH0_AUTH_TOKEN  Dash0 auth token                          (Dash0 → Organization settings → Auth tokens)
+#   DASH0_DATASET     dataset id, e.g. "default" or "dev"
+#
+# The `debug` exporter prints a one-line summary per batch so you can see data flowing locally;
+# raise `verbosity` to `detailed` to dump whole spans.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+  resourcedetection:
+    detectors: [env, system, docker]
+    timeout: 5s
+    override: false
+  batch:
+    send_batch_size: 512
+    timeout: 2s
+
+exporters:
+  otlp/dash0:
+    endpoint: ${env:DASH0_ENDPOINT}
+    headers:
+      Authorization: "Bearer ${env:DASH0_AUTH_TOKEN}"
+      Dash0-Dataset: ${env:DASH0_DATASET}
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      queue_size: 2000
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlp/dash0, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlp/dash0, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlp/dash0, debug]

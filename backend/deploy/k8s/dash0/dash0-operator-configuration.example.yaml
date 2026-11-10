@@ -1,0 +1,25 @@
+# Cluster-scoped, ONE per cluster. Only needed if the operator was installed WITHOUT
+# `--set operator.dash0Export.enabled=true ...` (the Helm flags create this resource for you; do not
+# have both, the operator overwrites a Helm-managed one on restart).
+#
+# Field names checked against https://www.dash0.com/docs/dash0/monitoring/kubernetes/dash0-operator/configuration
+# (2026-11). Endpoint and API endpoint are shown in Dash0 → Organization settings → Endpoints.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0OperatorConfiguration
+metadata:
+  name: dash0-operator-configuration
+spec:
+  clusterName: evently-dev # adds k8s.cluster.name to all telemetry
+  exports:
+    - dash0:
+        endpoint: ingress.eu-west-1.aws.dash0.com:4317 # always starts with ingress. and ends in dash0.com:4317
+        apiEndpoint: https://api.eu-west-1.aws.dash0.com
+        dataset: default
+        authorization:
+          # Exactly one of `token` or `secretRef`. Never commit a token; the Secret below is created with:
+          #   kubectl -n dash0-system create secret generic dash0-authorization-secret --from-literal=token=auth_...
+          secretRef:
+            name: dash0-authorization-secret
+            key: token
+  telemetryCollection:
+    enabled: true

@@ -1,0 +1,53 @@
+# Session affinity for the realtime WebSockets (ingress-nginx).
+#
+# Why a separate Ingress: `upstream-hash-by` applies to every path of an Ingress object, and REST
+# traffic should stay round-robin. ingress-nginx merges rules for the same host, and longer paths
+# win, so /ws/sessions and /ws/events are routed by this object and everything else by `evently-api`.
+#
+# Hash key `$uri` = the request path without the query string (tokens live in `?token=`), so:
+#   /ws/sessions/{sid}         all control sockets of a session land on one pod (presence, runtime state)
+#   /ws/sessions/{sid}/audio   speaker + every listener of a session land on one pod (in-memory AudioHub)
+#   /ws/events/{eid}           all collaborators on one board land on one pod (presence snapshot)
+# Control and audio sockets of the same session hash to *different* keys and may sit on different
+# pods; that is fine today because the hub publishes `session.audio.state` over the Redis bus.
+# If a later feature needs both on one pod, switch to the regex capture variant described in
+# docs/DEPLOYMENT.md (hash on a `$session_id` named capture).
+#
+# Trade-offs vs cookie affinity (`nginx.ingress.kubernetes.io/affinity: cookie`): cookies pin a
+# *browser*, so two attendees of one session would land on different pods and never share a hub;
+# path hashing pins a *session*. Downsides: a hot session cannot be spread, and scaling events remap
+# ~1/N of the keys (consistent hashing) — those clients reconnect and replay with `?since=`.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: evently-ws
+  labels:
+    app.kubernetes.io/name: evently-api
+    app.kubernetes.io/component: ingress
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$uri"
+    nginx.ingress.kubernetes.io/upstream-hash-by-subset: "false"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.evently.example
+      http:
+        paths:
+          - path: /ws/sessions
+            pathType: Prefix
+            backend:
+              service:
+                name: evently-api
+                port:
+                  name: http
+          - path: /ws/events
+            pathType: Prefix
+            backend:
+              service:
+                name: evently-api
+                port:
+                  name: http

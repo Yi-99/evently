@@ -1,0 +1,835 @@
+# Evently backend: one-command local server, Docker Compose stack and Kubernetes (kind) cluster.
+# go-task v3 (https://taskfile.dev). First time:  brew install go-task && task setup && task dev
+# Everything is listed with:  task            (same as `task --list`)
+#
+# Conventions
+#   * Variables can be overridden on the command line:   task docker:build IMAGE=evently-api:test
+#   * Secrets are read from the environment / `.env` (loaded by `dotenv` below), never from the
+#     command line, so they do not end up in the echoed command text.
+#   * Kubernetes tasks always pass --context explicitly (default: the kind cluster `kind-evently`),
+#     so a task can never hit whatever cluster happens to be your current kubectl context.
+#   * Full walkthrough: docs/DEPLOYMENT.md -> "Quick start with Task".
+#
+# Needs go-task >= 3.40 (`requires`, `prompt`, `TASK_EXE`); `brew install go-task` gives the latest.
+
+version: '3'
+
+silent: false
+dotenv: ['.env']
+
+# Container engine: podman (default) or docker. Override per call (`task ENGINE=docker …`) or `export ENGINE=docker`.
+# With podman, kind is told to use it (KIND_EXPERIMENTAL_PROVIDER) and compose runs as `podman compose`.
+env:
+  KIND_EXPERIMENTAL_PROVIDER: '{{if eq .ENGINE "podman"}}podman{{end}}'
+
+vars:
+  ENGINE: '{{.ENGINE | default "podman"}}'
+  COMPOSE: '{{.ENGINE | default "podman"}} compose'
+  # --- naming (the manifests under deploy/k8s hard-code namespace `evently`) -------------------
+  NAMESPACE: evently
+  CLUSTER: evently
+  OVERLAY: dev                 # deploy/k8s/overlays/<OVERLAY>: dev | prod
+  # Local image (docker:build, kind load); also what the dev overlay runs. Podman names a bare tag
+  # `localhost/<name>`, so the fully-qualified name is used there to match what ends up in kind.
+  IMAGE: '{{if eq .ENGINE "podman"}}localhost/{{end}}evently-api:dev'
+  # Podman defaults to OCI image format, which drops HEALTHCHECK; `--format docker` keeps it.
+  BUILD_FLAGS: '{{if eq .ENGINE "podman"}}--format docker{{end}}'
+  # IMAGE_TAG / IMAGE_REPO are only used for prod and are deliberately NOT defaulted:
+  #   task k8s:deploy:prod IMAGE_REPO=ghcr.io/<org>/evently-api IMAGE_TAG=sha-<commit> KUBE_CONTEXT=<ctx>
+  # --- local server -------------------------------------------------------------------------
+  PORT: 8000
+  BASE_URL: http://localhost:8000
+  VENV: .venv
+  # --- frontend (Vite + React, ../frontend) --------------------------------------------------
+  FRONTEND: '{{.ROOT_DIR}}/../frontend'
+  FE_PORT: 5173
+  # --- kubernetes ---------------------------------------------------------------------------
+  K8S_DIR: deploy/k8s
+  KUBE_CONTEXT: kind-{{.CLUSTER}}
+  KUBECTL: kubectl --context {{.KUBE_CONTEXT}}
+  KN: kubectl --context {{.KUBE_CONTEXT}} --namespace {{.NAMESPACE}}
+  INGRESS_NGINX_VERSION: controller-v1.15.1
+  # --- Dash0 operator (values from docs/DEPLOYMENT.md 4.7). DASH0_AUTH_TOKEN, DASH0_ENDPOINT and
+  #     DASH0_API_ENDPOINT are read from .env / the environment (endpoint defaults: us-west-2.aws, the org's region) ---
+  DASH0_NAMESPACE: dash0-system
+  DASH0_CLUSTER_NAME: evently-dev
+
+tasks:
+
+  default:
+    desc: List all tasks
+    silent: true
+    cmds:
+      - '{{.TASK_EXE}} --list'
+
+  # =============================================================================================
+  # Setup and tooling
+  # =============================================================================================
+
+  setup:
+    desc: Create .venv (python3.13), install ".[dev,otel,search]", copy .env.example to .env
+    preconditions:
+      - sh: command -v python3.13 >/dev/null 2>&1 || test -x {{.VENV}}/bin/python
+        msg: "python3.13 not found. Install it with: brew install python@3.13"
+    cmds:
+      - test -d {{.VENV}} || python3.13 -m venv {{.VENV}}
+      - '{{.VENV}}/bin/python -m pip install --upgrade pip'
+      - '{{.VENV}}/bin/python -m pip install -e ".[dev,otel,search]"'
+      - |
+        if [ -f .env ]; then
+          echo ".env already exists, leaving it alone"
+        else
+          cp .env.example .env
+          echo "Created .env from .env.example. Put your ANTHROPIC_API_KEY (and other keys) in it."
+        fi
+
+  tools:install:
+    desc: brew install go-task kind helm podman podman-compose, then create a rootful podman machine
+    preconditions:
+      - sh: command -v brew >/dev/null 2>&1
+        msg: "Homebrew not found. Install it from https://brew.sh first."
+    cmds:
+      - brew install go-task kind helm podman podman-compose
+      - |
+        if ! podman machine list --format '{{"{{"}}.Name{{"}}"}}' 2>/dev/null | grep -q .; then
+          podman machine init --cpus 4 --memory 8192 --disk-size 60 --rootful
+        fi
+        podman machine start 2>/dev/null || true
+        echo "Podman machine ready. Using Docker instead? Run tasks with ENGINE=docker."
+      - |
+        echo ""
+        echo "Container engine: Podman (installed above). To use Docker Desktop / OrbStack instead, run tasks with ENGINE=docker."
+        echo "Optional: Radar UI (brew install kubectl-radar), sonar-scanner (brew install sonar-scanner)."
+        echo "kubectl is already installed. Run 'task tools:check' to verify everything."
+
+  tools:check:
+    desc: Report which of docker, kind, kubectl, helm, task, radar are installed
+    cmds:
+      - |
+        missing=0
+        for t in {{.ENGINE}} kind kubectl helm task radar; do
+          case "$t" in
+            docker)  hint='Docker Desktop (brew install --cask docker) or OrbStack (brew install --cask orbstack)' ;;
+            kind)    hint='brew install kind' ;;
+            kubectl) hint='brew install kubectl' ;;
+            helm)    hint='brew install helm' ;;
+            task)    hint='brew install go-task' ;;
+            radar)   hint='brew install kubectl-radar   (optional)' ;;
+          esac
+          if [ "$t" = radar ]; then
+            p="$(command -v radar || command -v kubectl-radar || true)"
+          else
+            p="$(command -v "$t" || true)"
+          fi
+          if [ -n "$p" ]; then
+            printf '  %-8s ok        %s\n' "$t" "$p"
+          else
+            printf '  %-8s MISSING   %s\n' "$t" "$hint"
+            missing=$((missing + 1))
+          fi
+        done
+        if command -v {{.ENGINE}} >/dev/null 2>&1 && ! {{.ENGINE}} info >/dev/null 2>&1; then
+          echo "  {{.ENGINE}}   installed, but not running: \`podman machine start\` (or start Docker Desktop with ENGINE=docker)"
+        fi
+        echo ""
+        echo "$missing tool(s) missing."
+
+  # =============================================================================================
+  # Local development (no containers: SQLite, in-process everything)
+  # =============================================================================================
+
+  dev:
+    desc: Run the API with auto-reload on http://localhost:8000 (docs at /docs)
+    preconditions:
+      - sh: test -x {{.VENV}}/bin/uvicorn
+        msg: "No virtualenv yet. Run: task setup"
+    cmds:
+      - '{{.VENV}}/bin/uvicorn app.main:app_factory --factory --reload --port {{.PORT}}'
+
+  run:
+    desc: Run the API without auto-reload on http://localhost:8000
+    preconditions:
+      - sh: test -x {{.VENV}}/bin/uvicorn
+        msg: "No virtualenv yet. Run: task setup"
+    cmds:
+      - '{{.VENV}}/bin/uvicorn app.main:app_factory --factory --port {{.PORT}}'
+
+  lint:
+    desc: ruff check + ruff format --check (stricter than CI, which only runs ruff check)
+    preconditions:
+      - sh: test -x {{.VENV}}/bin/ruff
+        msg: "ruff not installed. Run: task setup"
+    cmds:
+      - '{{.VENV}}/bin/ruff check .'
+      - '{{.VENV}}/bin/ruff format --check .'
+
+  format:
+    desc: Apply ruff formatting to the whole project
+    preconditions:
+      - sh: test -x {{.VENV}}/bin/ruff
+        msg: "ruff not installed. Run: task setup"
+    cmds:
+      - '{{.VENV}}/bin/ruff format .'
+
+  db:reset:
+    desc: Delete the local SQLite database (evently.db and its -wal/-shm files)
+    prompt: This deletes evently.db* in the project root (all local events, chats and decks). Continue?
+    cmds:
+      - rm -f evently.db evently.db-wal evently.db-shm
+      - echo "Local database removed; it is recreated on the next start."
+
+  env:check:
+    desc: Show which keys of .env.example are set in .env (values are masked)
+    preconditions:
+      - sh: test -f .env
+        msg: ".env not found. Run: task setup"
+    cmds:
+      - |
+        awk '
+          NR == FNR {
+            if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { k = $1; sub(/=.*/, "", k); val[k] = substr($0, index($0, "=") + 1); inenv[k] = 1 }
+            next
+          }
+          /^[A-Za-z_][A-Za-z0-9_]*=/ {
+            k = $0; sub(/=.*/, "", k); known[k] = 1
+            if (!(k in inenv))       printf "  %-30s not in .env\n", k
+            else if (val[k] == "")   printf "  %-30s empty\n", k
+            else                     printf "  %-30s set      ******** (%d chars)\n", k, length(val[k])
+          }
+          END {
+            for (k in inenv) if (!(k in known)) printf "  %-30s set (not in .env.example)\n", k
+          }
+        ' .env .env.example | sort
+        echo ""
+        echo "empty = not configured (the app treats empty values as unset)."
+
+  # =============================================================================================
+  # Frontend (../frontend: Vite dev server on :5173, proxies /api and /ws to the API on :8000)
+  # =============================================================================================
+
+  fe:install:
+    desc: Install the frontend's npm dependencies
+    dir: '{{.FRONTEND}}'
+    cmds:
+      - npm install
+
+  fe:dev:
+    desc: Run the Vite dev server on http://localhost:5173 (proxies /api and /ws to :8000)
+    dir: '{{.FRONTEND}}'
+    preconditions:
+      - sh: test -d {{.FRONTEND}}/node_modules
+        msg: "Frontend dependencies missing. Run: task fe:install"
+    cmds:
+      - npx vite --port {{.FE_PORT}} --strictPort
+
+  fe:build:
+    desc: Type-check and build the frontend into ../frontend/dist
+    dir: '{{.FRONTEND}}'
+    preconditions:
+      - sh: test -d {{.FRONTEND}}/node_modules
+        msg: "Frontend dependencies missing. Run: task fe:install"
+    cmds:
+      - npm run build
+
+  fe:types:
+    desc: Regenerate frontend/src/api/schema.d.ts from the API's OpenAPI document (no server needed)
+    dir: '{{.FRONTEND}}'
+    preconditions:
+      - sh: test -x {{.ROOT_DIR}}/{{.VENV}}/bin/python
+        msg: "No virtualenv yet. Run: task setup"
+    cmds:
+      - PYTHON={{.ROOT_DIR}}/{{.VENV}}/bin/python npm run api:types
+
+  dev:all:
+    desc: Run the API (:8000, auto-reload) and the frontend (:5173) together; Ctrl-C stops both
+    deps: [dev, fe:dev]
+
+  # =============================================================================================
+  # Docker Compose stack: api + postgres + redis + elasticsearch + otel-collector
+  # =============================================================================================
+
+  compose:up:
+    desc: Build and start the whole stack in the background (API on :8000)
+    preconditions: &docker_ready
+      - sh: command -v {{.ENGINE}} >/dev/null 2>&1
+        msg: "{{.ENGINE}} not found. Run: task tools:install (Podman), or use ENGINE=docker with Docker Desktop / OrbStack."
+      - sh: '{{.ENGINE}} info >/dev/null 2>&1'
+        msg: "{{.ENGINE}} is not running. Run `podman machine start` (or start Docker Desktop with ENGINE=docker) and retry."
+    cmds:
+      - '{{.COMPOSE}} up --build --detach'
+      - |
+        echo ""
+        echo "API: http://localhost:8000  (docs: /docs)   Logs: task compose:logs   Stop: task compose:down"
+        echo "Elasticsearch needs ~1 minute to become healthy; the API waits for it."
+
+  compose:up:tools:
+    desc: Same as compose:up plus Kibana (profile "tools") on http://localhost:5601
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} --profile tools up --build --detach'
+
+  compose:down:
+    desc: Stop and remove the stack's containers (data volumes are kept)
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} --profile tools down'
+
+  compose:down:volumes:
+    desc: Stop the stack AND delete its volumes (Postgres and Elasticsearch data)
+    prompt: This deletes the postgres-data and es-data volumes. Continue?
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} --profile tools down --volumes'
+
+  compose:logs:
+    desc: "Follow stack logs (all services, or one: task compose:logs SERVICE=api)"
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} logs --follow --tail=200 {{.SERVICE}}'
+
+  compose:ps:
+    desc: Show the status of the stack's containers
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} --profile tools ps'
+
+  compose:build:
+    desc: Build the API image through compose (tag evently-api:dev)
+    preconditions: *docker_ready
+    cmds:
+      - '{{.COMPOSE}} build'
+
+  # =============================================================================================
+  # Single container
+  # =============================================================================================
+
+  docker:build:
+    desc: Build the API image (IMAGE, default evently-api:dev)
+    preconditions: *docker_ready
+    cmds:
+      - '{{.ENGINE}} build {{.BUILD_FLAGS}} --tag {{.IMAGE}} .'
+
+  docker:run:
+    desc: Run the API image on http://localhost:8000 with .env (SQLite in a named volume)
+    preconditions:
+      - sh: command -v {{.ENGINE}} >/dev/null 2>&1 && {{.ENGINE}} info >/dev/null 2>&1
+        msg: "Docker is not installed or its daemon is not running (see: task tools:check)."
+      - sh: test -f .env
+        msg: ".env not found. Run: task setup"
+      - sh: '{{.ENGINE}} image inspect {{.IMAGE}} >/dev/null 2>&1'
+        msg: "Image {{.IMAGE}} not found. Run: task docker:build"
+    cmds:
+      # DATABASE_URL is forced to the container's /data volume: the .env value (./evently.db) is a host path.
+      - >-
+        {{.ENGINE}} run --rm --publish {{.PORT}}:8000 --env-file .env
+        --env DATABASE_URL=sqlite+aiosqlite:////data/evently.db
+        --volume evently-data:/data {{.IMAGE}}
+
+  # =============================================================================================
+  # Kubernetes: local kind cluster with ingress-nginx (ports 80/443 on localhost)
+  # =============================================================================================
+
+  k8s:up:
+    desc: "One command: kind cluster + ingress-nginx + image + dev stack (Postgres, Redis, Elasticsearch)"
+    cmds:
+      - task: k8s:cluster:up
+      - task: k8s:image:load
+      - task: k8s:deploy:dev
+      - |
+        echo ""
+        echo "Evently is up on the kind cluster."
+        echo "  Via ingress:  http://api.evently.localtest.me/api/v1/health   (docs: /docs)"
+        echo "  Port-forward: task k8s:port-forward   then   http://localhost:{{.PORT}}"
+        echo "  Look around:  task k8s:status | task k8s:logs | task k8s:radar"
+
+  k8s:cluster:up:
+    desc: Create the kind cluster "evently" (host ports 80/443) and install ingress-nginx
+    preconditions:
+      - sh: command -v kind >/dev/null 2>&1
+        msg: "kind not found. Run: task tools:install"
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+      - sh: command -v {{.ENGINE}} >/dev/null 2>&1 && {{.ENGINE}} info >/dev/null 2>&1
+        msg: "{{.ENGINE}} is not installed or not running. Podman: `podman machine start` (or task tools:install); Docker: start Docker Desktop."
+    cmds:
+      - |
+        if kind get clusters 2>/dev/null | grep -qx "{{.CLUSTER}}"; then
+          echo "kind cluster '{{.CLUSTER}}' already exists, reusing it"
+        else
+          cat <<'EOF' | kind create cluster --name "{{.CLUSTER}}" --config=-
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+          - role: control-plane
+            kubeadmConfigPatches:
+              - |
+                kind: InitConfiguration
+                nodeRegistration:
+                  kubeletExtraArgs:
+                    node-labels: "ingress-ready=true"
+            extraPortMappings:
+              - containerPort: 80
+                hostPort: 80
+                protocol: TCP
+              - containerPort: 443
+                hostPort: 443
+                protocol: TCP
+        EOF
+        fi
+      - '{{.KUBECTL}} apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/{{.INGRESS_NGINX_VERSION}}/deploy/static/provider/kind/deploy.yaml'
+      - |
+        # The controller pod does not exist for a moment after the apply; `kubectl wait` fails on "no resources".
+        for i in $(seq 1 60); do
+          {{.KUBECTL}} --namespace ingress-nginx get pod --selector=app.kubernetes.io/component=controller -o name 2>/dev/null | grep -q . && break
+          sleep 2
+        done
+        {{.KUBECTL}} --namespace ingress-nginx wait --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller --timeout=180s
+      - task: k8s:dns:upstream
+      - task: k8s:dns:fix
+      - echo "kind cluster '{{.CLUSTER}}' is ready (context {{.KUBE_CONTEXT}}), ingress-nginx is running."
+
+  k8s:dns:upstream:
+    desc: Point CoreDNS at public resolvers when the kind node's own upstream list contains a dead one
+    # On Podman the kind node's resolv.conf lists an IPv6 ULA nameserver first that never answers, so every pod
+    # lookup of an external name waits ~5 s for it to time out (LLM calls and OTLP exports then time out).
+    # Overridable: task k8s:dns:upstream UPSTREAMS="9.9.9.9 1.1.1.1"
+    vars:
+      UPSTREAMS: '{{.UPSTREAMS | default "1.1.1.1 8.8.8.8"}}'
+    preconditions:
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - |
+        set -e
+        f="$(mktemp)"
+        {{.KUBECTL}} --namespace kube-system get configmap coredns -o jsonpath='{.data.Corefile}' \
+          | sed 's#forward \. /etc/resolv.conf#forward . {{.UPSTREAMS}}#' > "$f"
+        {{.KUBECTL}} --namespace kube-system create configmap coredns --from-file=Corefile="$f" --dry-run=client -o yaml \
+          | {{.KUBECTL}} replace -f -
+        rm -f "$f"
+        {{.KUBECTL}} --namespace kube-system rollout restart deployment/coredns
+        {{.KUBECTL}} --namespace kube-system rollout status deployment/coredns --timeout=120s
+
+  k8s:dns:fix:
+    desc: Stop wildcard DNS search domains inherited from the host network hijacking external names in pods
+    # Pods use ndots:5 and inherit the host's search list, so api.anthropic.com is first tried as
+    # api.anthropic.com.<search-domain>. If that domain has a wildcard record, every external name resolves to
+    # the wildcard's IP (seen as connect timeouts / TLS failures). CoreDNS answers NXDOMAIN for such domains, so
+    # the lookup falls through to the real name. Re-run after joining a network with other search domains.
+    preconditions:
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+      - sh: '{{.ENGINE}} exec {{.CLUSTER}}-control-plane true'
+        msg: "kind node {{.CLUSTER}}-control-plane is not reachable through {{.ENGINE}}."
+    cmds:
+      - |
+        set -e
+        node="{{.CLUSTER}}-control-plane"
+        zones=""
+        for d in $({{.ENGINE}} exec "$node" awk '/^search/ { $1 = ""; print }' /etc/resolv.conf); do
+          if {{.ENGINE}} exec "$node" getent hosts "evently-wildcard-probe-$(date +%s).$d." >/dev/null 2>&1; then
+            zones="$zones $d"
+          fi
+        done
+        f="$(mktemp)"
+        {{.KUBECTL}} --namespace kube-system get configmap coredns -o jsonpath='{.data.Corefile}' \
+          | awk '/^# BEGIN evently-wildcard-dns$/ { skip = 1; next } /^# END evently-wildcard-dns$/ { skip = 0; next } !skip' > "$f"
+        if [ -n "$zones" ]; then
+          {
+            echo "# BEGIN evently-wildcard-dns"
+            for z in $zones; do
+              printf '%s:53 {\n    template ANY ANY {\n        rcode NXDOMAIN\n    }\n}\n' "$z"
+            done
+            echo "# END evently-wildcard-dns"
+          } >> "$f"
+        fi
+        {{.KUBECTL}} --namespace kube-system create configmap coredns --from-file=Corefile="$f" --dry-run=client -o yaml \
+          | {{.KUBECTL}} replace -f -
+        rm -f "$f"
+        {{.KUBECTL}} --namespace kube-system rollout restart deployment/coredns
+        {{.KUBECTL}} --namespace kube-system rollout status deployment/coredns --timeout=120s
+        echo "Wildcard search domains blocked in CoreDNS:${zones:- none}"
+
+  k8s:cluster:down:
+    desc: Delete the kind cluster "evently" (everything inside it is lost)
+    prompt: This deletes the kind cluster "{{.CLUSTER}}" and everything in it. Continue?
+    preconditions:
+      - sh: command -v kind >/dev/null 2>&1
+        msg: "kind not found. Run: task tools:install"
+    cmds:
+      - kind delete cluster --name {{.CLUSTER}}
+
+  k8s:image:load:
+    desc: Build the API image (IMAGE) and load it into the kind cluster
+    preconditions:
+      - sh: command -v kind >/dev/null 2>&1 && command -v {{.ENGINE}} >/dev/null 2>&1 && {{.ENGINE}} info >/dev/null 2>&1
+        msg: "kind or {{.ENGINE}} missing, or the engine is not running (see: task tools:check)."
+      - sh: kind get clusters 2>/dev/null | grep -qx "{{.CLUSTER}}"
+        msg: "kind cluster '{{.CLUSTER}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - '{{.ENGINE}} build {{.BUILD_FLAGS}} --tag {{.IMAGE}} .'
+      - |
+        # `kind load docker-image` only works against a Docker daemon; with Podman kind cannot see the
+        # image ("not present locally"), so hand it a tarball instead. Works for both engines.
+        set -e
+        archive="$(mktemp -t evently-image.XXXXXX).tar"
+        {{.ENGINE}} save --format docker-archive --output "$archive" {{.IMAGE}} 2>/dev/null \
+          || {{.ENGINE}} save --output "$archive" {{.IMAGE}}
+        kind load image-archive "$archive" --name {{.CLUSTER}}
+        rm -f "$archive"
+        echo "Loaded {{.IMAGE}} into kind cluster '{{.CLUSTER}}'."
+
+  k8s:render:
+    desc: Print the manifests for OVERLAY (dev|prod) as deployed; SCALE_OUT=true adds the scale-out component
+    # Why not `kubectl apply -k` directly? The overlays reference ghcr.io/OWNER/evently-api (a placeholder
+    # registry) and dev sets imagePullPolicy: Always, which cannot work with an image loaded into kind.
+    # So we render with `kubectl kustomize`, rewrite the image, drop the placeholder Secret (it is created
+    # by k8s:secrets:* from real values; applying the template would overwrite them) and apply the result.
+    # WITH_SECRET=true keeps the placeholder Secret in the output (to read it, never to apply it).
+    preconditions:
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+      - sh: test -f {{.K8S_DIR}}/overlays/{{.OVERLAY}}/kustomization.yaml
+        msg: "Unknown OVERLAY '{{.OVERLAY}}'. Use one of the directories in {{.K8S_DIR}}/overlays."
+    cmds:
+      - |
+        set -e
+        src="{{.K8S_DIR}}/overlays/{{.OVERLAY}}"
+        tmp=""
+        if [ "{{.SCALE_OUT}}" = "true" ]; then
+          # The component is a commented-out block in the overlay. Uncomment it in a throw-away copy,
+          # so no tracked file is touched. (Manual equivalent: uncomment `components:` in the overlay.)
+          tmp="$(mktemp -d)"
+          cp -R "{{.K8S_DIR}}" "$tmp/k8s"
+          sed -e 's|^# components:|components:|' -e 's|^#   - ../../components/scale-out|  - ../../components/scale-out|' \
+            "$src/kustomization.yaml" > "$tmp/kustomization.yaml"
+          mv "$tmp/kustomization.yaml" "$tmp/k8s/overlays/{{.OVERLAY}}/kustomization.yaml"
+          src="$tmp/k8s/overlays/{{.OVERLAY}}"
+        fi
+        out="$(kubectl kustomize "$src")"
+        if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+        case "{{.OVERLAY}}" in
+          dev)
+            out="$(printf '%s\n' "$out" | sed -E \
+              -e 's#ghcr\.io/OWNER/evently-api:[^[:space:]"]+#{{.IMAGE}}#' \
+              -e 's#imagePullPolicy: Always#imagePullPolicy: IfNotPresent#')" ;;
+          prod)
+            if [ -n "{{.IMAGE_REPO}}" ] && [ -n "{{.IMAGE_TAG}}" ]; then
+              out="$(printf '%s\n' "$out" | sed -E -e 's#ghcr\.io/OWNER/evently-api:[^[:space:]"]+#{{.IMAGE_REPO}}:{{.IMAGE_TAG}}#')"
+            fi ;;
+        esac
+        if [ "{{.WITH_SECRET}}" != "true" ]; then
+          out="$(printf '%s\n' "$out" | awk '
+            function flush() {
+              if (doc != "" && !(doc ~ /\nkind: Secret\n/ && doc ~ /\n  name: evently-api-secrets\n/)) { printf "%s", (n++ ? "---\n" : "") doc }
+              doc = ""
+            }
+            /^---$/ { flush(); next }
+            { doc = doc $0 "\n" }
+            END { flush() }')"
+        fi
+        printf '%s\n' "$out"
+
+  k8s:deploy:dev:
+    desc: Render and apply overlays/dev to the kind cluster, create the Secret from .env, wait for the API
+    preconditions:
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up (or pass KUBE_CONTEXT=...)"
+    cmds:
+      - '{{.TASK_EXE}} k8s:render OVERLAY=dev IMAGE={{.IMAGE}} | {{.KUBECTL}} apply -f -'
+      - task: k8s:secrets:dev
+        vars: {RESTART: "false"}
+      - '{{.KN}} rollout status deploy/evently-api --timeout=300s'
+      - echo "API ready. http://api.evently.localtest.me/api/v1/health  (or task k8s:port-forward)"
+
+  k8s:secrets:dev:
+    desc: Create/replace the dev Secret evently-api-secrets from .env (keys only the API needs)
+    # The Secret name comes from deploy/k8s/base/secret.yaml. DATABASE_URL and SECRET_KEY are NOT taken from
+    # .env (its DATABASE_URL points at a local SQLite file); they are read from the rendered dev overlay so
+    # they match the in-cluster Postgres. ELASTICSEARCH_URL/KEY (Elastic Cloud) and OTEL_EXPORTER_OTLP_HEADERS come from .env.
+    # DASH0_AUTH_TOKEN, when set in .env or the environment, becomes OTEL_EXPORTER_OTLP_HEADERS.
+    preconditions:
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+      - sh: test -f .env
+        msg: ".env not found. Run: task setup (then fill in ANTHROPIC_API_KEY)"
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - |
+        set -e
+        f="$(mktemp)"
+        rc=0
+        {
+          kubectl kustomize {{.K8S_DIR}}/overlays/dev \
+            | sed -n -E 's/^  (DATABASE_URL|SECRET_KEY): "?([^"]*)"?$/\1=\2/p'
+          tr -d '\r' < .env \
+            | grep -E '^(ANTHROPIC_API_KEY|LLM_PROVIDER|LLM_PROVIDER_OVERRIDES|OPENAI_ORCHESTRATOR_MODEL|OPENAI_WORKER_MODEL|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|DEEPGRAM_API_KEY|ASSEMBLYAI_API_KEY|OPENAI_API_KEY|STT_PROVIDER|LIVEKIT_URL|LIVEKIT_API_KEY|LIVEKIT_API_SECRET|EMAIL_PROVIDER|EMAIL_FROM|RESEND_API_KEY|SMTP_HOST|SMTP_PORT|SMTP_USERNAME|SMTP_PASSWORD|LUMA_API_KEY|ELASTICSEARCH_URL|ELASTICSEARCH_API_KEY|OTEL_EXPORTER_OTLP_HEADERS)=.+' \
+            | sed -E -e 's/^([A-Z0-9_]+)="(.*)"$/\1=\2/' -e "s/^([A-Z0-9_]+)='(.*)'\$/\1=\2/" || true
+          if [ -n "$DASH0_AUTH_TOKEN" ]; then echo "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer $DASH0_AUTH_TOKEN"; fi
+        } > "$f"
+        llm="$(sed -n 's/^LLM_PROVIDER=//p' "$f" | tail -n 1)"
+        if [ "$llm" = openai ]; then llm_key=OPENAI_API_KEY; else llm_key=ANTHROPIC_API_KEY; fi
+        grep -q "^$llm_key=." "$f" || echo "WARNING: $llm_key is empty in .env (LLM_PROVIDER=${llm:-anthropic}); chat, venue research and decks will not work."
+        grep -q '^DATABASE_URL=postgresql' "$f" || { rm -f "$f"; echo "Could not read DATABASE_URL from the dev overlay"; exit 1; }
+        {{.KUBECTL}} create namespace {{.NAMESPACE}} --dry-run=client -o yaml | {{.KUBECTL}} apply -f - || rc=$?
+        if [ "$rc" = 0 ]; then
+          {{.KN}} create secret generic evently-api-secrets --from-env-file="$f" --dry-run=client -o yaml \
+            | {{.KUBECTL}} apply -f - || rc=$?
+        fi
+        rm -f "$f"
+        if [ "$rc" != 0 ]; then exit "$rc"; fi
+        if [ "{{.RESTART}}" != "false" ] && {{.KN}} get deploy/evently-api >/dev/null 2>&1; then
+          {{.KN}} rollout restart deploy/evently-api
+        fi
+        echo "Secret evently-api-secrets updated in namespace {{.NAMESPACE}}."
+
+  k8s:secrets:prod:
+    desc: Create/replace the prod Secret from a real env file (ENV_FILE=prod.env KUBE_CONTEXT=<ctx>)
+    prompt: Write evently-api-secrets in namespace {{.NAMESPACE}} on context {{.KUBE_CONTEXT}} from {{.ENV_FILE}}?
+    requires:
+      vars: [ENV_FILE, KUBE_CONTEXT]
+    preconditions:
+      - sh: test "{{.KUBE_CONTEXT}}" != "kind-{{.CLUSTER}}"
+        msg: "Refusing to write prod secrets to the local kind cluster. Pass KUBE_CONTEXT=<your prod context>."
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found (kubectl config get-contexts)."
+      - sh: test -f "{{.ENV_FILE}}"
+        msg: "{{.ENV_FILE}} not found. Copy deploy/k8s/base/secret.yaml's keys into a KEY=value file (never commit it)."
+      - sh: "! grep -qE 'REPLACE_ME|USER:PASSWORD@HOST' \"{{.ENV_FILE}}\""
+        msg: "{{.ENV_FILE}} still contains placeholder values (REPLACE_ME / USER:PASSWORD@HOST)."
+      - sh: grep -qE '^DATABASE_URL=postgresql' "{{.ENV_FILE}}"
+        msg: "{{.ENV_FILE}} needs DATABASE_URL=postgresql+asyncpg://... (a managed Postgres; SQLite is not for prod)."
+    cmds:
+      - '{{.KUBECTL}} create namespace {{.NAMESPACE}} --dry-run=client -o yaml | {{.KUBECTL}} apply -f -'
+      - '{{.KN}} create secret generic evently-api-secrets --from-env-file="{{.ENV_FILE}}" --dry-run=client -o yaml | {{.KUBECTL}} apply -f -'
+
+  k8s:secrets:verify:
+    desc: Fail if the live Secret evently-api-secrets is missing or still holds template placeholders
+    internal: true
+    preconditions:
+      - sh: '{{.KN}} get secret evently-api-secrets >/dev/null 2>&1'
+        msg: "Secret evently-api-secrets not found in {{.NAMESPACE}} on {{.KUBE_CONTEXT}}. Create it: task k8s:secrets:prod ENV_FILE=prod.env KUBE_CONTEXT={{.KUBE_CONTEXT}}"
+      - sh: |
+          bad="$({{.KN}} get secret evently-api-secrets -o jsonpath='{range .data.*}{@}{"\n"}{end}' \
+            | while read -r v; do printf '%s' "$v" | base64 -d; echo; done \
+            | grep -E 'REPLACE_ME|USER:PASSWORD@HOST' || true)"
+          test -z "$bad"
+        msg: "Secret evently-api-secrets still contains template placeholders (REPLACE_ME / USER:PASSWORD@HOST). Recreate it with real values: task k8s:secrets:prod"
+
+  k8s:deploy:prod:
+    desc: Apply overlays/prod (IMAGE_REPO, IMAGE_TAG, KUBE_CONTEXT required; real Secret must exist)
+    prompt: Deploy {{.IMAGE_REPO}}:{{.IMAGE_TAG}} to context {{.KUBE_CONTEXT}}, namespace {{.NAMESPACE}}?
+    requires:
+      vars: [IMAGE_REPO, IMAGE_TAG, KUBE_CONTEXT]
+    preconditions:
+      - sh: test "{{.KUBE_CONTEXT}}" != "kind-{{.CLUSTER}}"
+        msg: "Refusing to deploy prod to the local kind cluster. Pass KUBE_CONTEXT=<your prod context>."
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found (kubectl config get-contexts)."
+      - sh: test "{{.IMAGE_TAG}}" != "latest"
+        msg: "Pin a release tag or sha-<commit> tag; never 'latest' in prod (see overlays/prod/kustomization.yaml)."
+      - sh: test "{{.IMAGE_REPO}}" != "ghcr.io/OWNER/evently-api"
+        msg: "IMAGE_REPO is still the placeholder. Use e.g. IMAGE_REPO=ghcr.io/<org>/evently-api (the repo CI pushes to)."
+    deps:
+      - task: k8s:secrets:verify
+    cmds:
+      - '{{.TASK_EXE}} k8s:render OVERLAY=prod IMAGE_REPO={{.IMAGE_REPO}} IMAGE_TAG={{.IMAGE_TAG}} | {{.KUBECTL}} diff -f - || true'
+      - '{{.TASK_EXE}} k8s:render OVERLAY=prod IMAGE_REPO={{.IMAGE_REPO}} IMAGE_TAG={{.IMAGE_TAG}} | {{.KUBECTL}} apply -f -'
+      - '{{.KN}} rollout status deploy/evently-api --timeout=300s'
+
+  k8s:status:
+    desc: Show pods, services, ingress and deployments in the evently namespace
+    preconditions:
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+    cmds:
+      - '{{.KN}} get deploy,statefulset,pods,svc,ingress -o wide'
+
+  k8s:logs:
+    desc: Follow the API deployment logs
+    cmds:
+      - '{{.KN}} logs deploy/evently-api --container api --follow --tail=200'
+
+  k8s:port-forward:
+    desc: Forward the API service to http://localhost:8000
+    cmds:
+      - '{{.KN}} port-forward svc/evently-api {{.PORT}}:80'
+
+  k8s:restart:
+    desc: Rolling restart of the API deployment (e.g. after changing the Secret or reloading the image)
+    cmds:
+      - '{{.KN}} rollout restart deploy/evently-api'
+      - '{{.KN}} rollout status deploy/evently-api --timeout=300s'
+
+  k8s:scale-out:enable:
+    desc: "Dev only: deploy with the scale-out component (2 pods, HPA, PDB, hash-routed /ws ingress)"
+    prompt: >-
+      Scale-out is NOT production-safe yet (DB-backed transcript seq and Redis locks are not done, see
+      docs/DEPLOYMENT.md section 6). Continue on {{.KUBE_CONTEXT}}?
+    preconditions:
+      - sh: test "{{.OVERLAY}}" = dev
+        msg: "Only the dev overlay is supported here. For prod uncomment the component in deploy/k8s/overlays/prod/kustomization.yaml."
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - |
+        echo "The manual equivalent: in deploy/k8s/overlays/dev/kustomization.yaml uncomment"
+        echo "    components:"
+        echo "      - ../../components/scale-out"
+        echo "This task renders a temporary copy with that edit and applies it; no file is changed."
+      - '{{.TASK_EXE}} k8s:render OVERLAY=dev SCALE_OUT=true IMAGE={{.IMAGE}} | {{.KUBECTL}} apply -f -'
+      - |
+        echo ""
+        echo "Note: the HPA needs metrics-server, which kind does not ship; it shows <unknown> targets until you install it."
+        echo "To go back to one pod: task k8s:deploy:dev, then:"
+        echo "  {{.KN}} delete hpa/evently-api pdb/evently-api ingress/evently-ws"
+
+  k8s:job:venue-research:
+    desc: Run one venue-research agent pod from the Job template (RUN_ID, EVENT_ID, CARD_ID required)
+    # deploy/k8s/jobs/venue-research-job.yaml is a design template: its entrypoint
+    # (python -m app.agents.worker) does not exist yet, so the pod starts and then fails (docs/DEPLOYMENT.md section 7).
+    requires:
+      vars: [RUN_ID, EVENT_ID, CARD_ID]
+    preconditions:
+      - sh: command -v envsubst >/dev/null 2>&1
+        msg: "envsubst not found. Run: brew install gettext"
+      - sh: printf '%s' "{{.RUN_ID}}" | grep -qE '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+        msg: "RUN_ID becomes part of the Job name, so it must be lowercase letters, digits and '-' (no underscores)."
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - |
+        RUN_ID='{{.RUN_ID}}' EVENT_ID='{{.EVENT_ID}}' CARD_ID='{{.CARD_ID}}' PLACE_ID='{{.PLACE_ID}}' \
+        TRACEPARENT='{{.TRACEPARENT}}' IMAGE_TAG='{{.IMAGE_TAG | default "dev"}}' \
+          envsubst '${RUN_ID} ${EVENT_ID} ${CARD_ID} ${PLACE_ID} ${TRACEPARENT} ${IMAGE_TAG}' \
+          < {{.K8S_DIR}}/jobs/venue-research-job.yaml \
+          | sed -E 's#ghcr\.io/OWNER/evently-api:[^[:space:]"]+#{{.IMAGE}}#' \
+          | {{.KUBECTL}} apply -f -
+      - 'echo "Watch it with: {{.KN}} get pods --selector=evently.dev/run-id={{.RUN_ID}} --watch"'
+
+  k8s:dash0:install:
+    desc: Install the Dash0 operator with helm (needs DASH0_AUTH_TOKEN in .env or the environment)
+    preconditions:
+      - sh: command -v helm >/dev/null 2>&1
+        msg: "helm not found. Run: task tools:install"
+      - sh: test -n "$DASH0_AUTH_TOKEN"
+        msg: "DASH0_AUTH_TOKEN is not set. Add it to .env (Dash0 > Organization settings > Auth tokens) or run: DASH0_AUTH_TOKEN=auth_... task k8s:dash0:install"
+      - sh: kubectl config get-contexts -o name | grep -qx "{{.KUBE_CONTEXT}}"
+        msg: "kubectl context '{{.KUBE_CONTEXT}}' not found. Run: task k8s:cluster:up"
+    cmds:
+      - helm repo add dash0-operator https://dash0hq.github.io/dash0-operator --force-update
+      - helm repo update dash0-operator
+      - '{{.KUBECTL}} create namespace {{.DASH0_NAMESPACE}} --dry-run=client -o yaml | {{.KUBECTL}} apply -f -'
+      - >-
+        {{.KUBECTL}} --namespace {{.DASH0_NAMESPACE}} create secret generic dash0-authorization-secret
+        --from-literal=token="$DASH0_AUTH_TOKEN" --dry-run=client -o yaml | {{.KUBECTL}} apply -f -
+      - >-
+        helm upgrade --install --wait --kube-context {{.KUBE_CONTEXT}} --namespace {{.DASH0_NAMESPACE}}
+        dash0-operator dash0-operator/dash0-operator
+        --set operator.dash0Export.enabled=true
+        --set operator.dash0Export.endpoint="${DASH0_ENDPOINT:-ingress.us-west-2.aws.dash0.com:4317}"
+        --set operator.dash0Export.apiEndpoint="${DASH0_API_ENDPOINT:-https://api.us-west-2.aws.dash0.com}"
+        --set operator.dash0Export.secretRef.name=dash0-authorization-secret
+        --set operator.dash0Export.secretRef.key=token
+        --set operator.clusterName={{.DASH0_CLUSTER_NAME}}
+        --set operator.instrumentation.enablePythonAutoInstrumentation=true
+      - 'echo "Operator installed. Next: task k8s:dash0:apply"'
+
+  k8s:dash0:apply:
+    desc: Enable Dash0 monitoring for the evently namespace (kubectl apply -k deploy/k8s/dash0)
+    preconditions:
+      - sh: command -v kubectl >/dev/null 2>&1
+        msg: "kubectl not found. Run: brew install kubectl"
+      - sh: '{{.KUBECTL}} get crd -o name | grep -q "operator.dash0.com"'
+        msg: "The Dash0 operator CRDs are not installed on {{.KUBE_CONTEXT}}. Run: task k8s:dash0:install"
+      - sh: '{{.KUBECTL}} get namespace {{.NAMESPACE}} >/dev/null 2>&1'
+        msg: "Namespace {{.NAMESPACE}} not found. Deploy first: task k8s:deploy:dev"
+    cmds:
+      - '{{.KUBECTL}} apply -k {{.K8S_DIR}}/dash0'
+
+  k8s:radar:
+    desc: Open the Radar UI (http://localhost:9280) on the current kubectl context
+    preconditions:
+      - sh: command -v radar >/dev/null 2>&1 || command -v kubectl-radar >/dev/null 2>&1
+        msg: "Radar not found. Install: brew install kubectl-radar   (or: curl -fsSL https://get.radarhq.io | sh, or brew install skyhook-io/tap/radar)"
+    cmds:
+      - |
+        echo "Radar uses the current kubectl context: $(kubectl config current-context)"
+        echo "To point it at the local cluster first: kubectl config use-context {{.KUBE_CONTEXT}}"
+        if command -v radar >/dev/null 2>&1; then
+          radar --namespace {{.NAMESPACE}}
+        else
+          kubectl radar --namespace {{.NAMESPACE}}
+        fi
+
+  k8s:nuke:
+    desc: Delete the evently namespace (all app, Postgres, Redis and Elasticsearch data in it)
+    prompt: This deletes namespace {{.NAMESPACE}} on context {{.KUBE_CONTEXT}} with everything in it. Continue?
+    cmds:
+      - '{{.KUBECTL}} delete namespace {{.NAMESPACE}} --ignore-not-found'
+
+  # =============================================================================================
+  # Quality, search and health
+  # =============================================================================================
+
+  ci:
+    desc: "What CI runs, locally: ruff check, then pytest tests (existing tests, ENVIRONMENT=test)"
+    preconditions:
+      - sh: test -x {{.VENV}}/bin/pytest
+        msg: "pytest not installed. Run: task setup"
+    cmds:
+      - '{{.VENV}}/bin/ruff check .'
+      - ENVIRONMENT=test {{.VENV}}/bin/pytest tests -q
+
+  sonar:scan:
+    desc: Run tests with coverage, then sonar-scanner (needs SONAR_TOKEN and a real sonar-project.properties)
+    preconditions:
+      - sh: command -v sonar-scanner >/dev/null 2>&1
+        msg: "sonar-scanner not found. Run: brew install sonar-scanner"
+      - sh: test -n "$SONAR_TOKEN"
+        msg: "SONAR_TOKEN is not set. Add it to .env or run: SONAR_TOKEN=... task sonar:scan (SonarQube Cloud > My Account > Security)"
+      - sh: "! grep -qE '^sonar\\.(organization=ORG|projectKey=ORG_evently)$' sonar-project.properties"
+        msg: "sonar-project.properties still has the ORG / ORG_evently placeholders. Copy the real values from SonarQube Cloud > Project > Information."
+      - sh: test -x {{.VENV}}/bin/pytest
+        msg: "pytest not installed. Run: task setup"
+    cmds:
+      # Same reports as the CI jobs (coverage.xml, pytest-report.xml, ruff-report.json); pytest-cov is CI-only, so install it here too.
+      - '{{.VENV}}/bin/python -m pip install --quiet pytest-cov'
+      - >-
+        ENVIRONMENT=test {{.VENV}}/bin/pytest tests -q --cov=app --cov-report=xml:coverage.xml
+        --cov-report=term-missing:skip-covered --junitxml=pytest-report.xml
+      - '{{.VENV}}/bin/ruff check --output-format=json --exit-zero -o ruff-report.json .'
+      - sonar-scanner {{.CLI_ARGS}}
+
+  search:status:
+    desc: GET /api/v1/search/status (BASE_URL to override; ACCESS_TOKEN env when auth is required)
+    cmds:
+      - |
+        if [ -n "$ACCESS_TOKEN" ]; then
+          curl -sS --fail-with-body --header "Authorization: Bearer $ACCESS_TOKEN" "{{.BASE_URL}}/api/v1/search/status"
+        else
+          curl -sS --fail-with-body "{{.BASE_URL}}/api/v1/search/status"
+        fi
+        echo ""
+
+  search:reindex:
+    desc: Rebuild the search indices from the database (all your events; EVENT_ID=... for one event)
+    cmds:
+      - |
+        if [ -n "{{.EVENT_ID}}" ]; then url="{{.BASE_URL}}/api/v1/events/{{.EVENT_ID}}/search/reindex"; else url="{{.BASE_URL}}/api/v1/search/reindex"; fi
+        if [ -n "$ACCESS_TOKEN" ]; then
+          curl -sS --fail-with-body --request POST --header "Authorization: Bearer $ACCESS_TOKEN" "$url"
+        else
+          curl -sS --fail-with-body --request POST "$url"
+        fi
+        echo ""
+
+  health:
+    desc: GET /api/v1/health (BASE_URL=http://api.evently.localtest.me to check the kind ingress)
+    cmds:
+      - curl -sS --fail-with-body "{{.BASE_URL}}/api/v1/health"
+      - echo ""

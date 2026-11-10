@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evently-api
+  labels:
+    app.kubernetes.io/name: evently-api
+    app.kubernetes.io/component: api
+    # Dash0 operator opt-in (the default; the label is here so the intent is visible next to Redis'
+    # opt-out). The operator injects k8s resource attributes and collects logs; its Python
+    # auto-instrumentation detects the app's own OTel SDK and steps aside (docs/OBSERVABILITY.md).
+    dash0.com/enable: "true"
+  annotations:
+    # Radar shows annotations in the resource drawer.
+    evently.dev/description: "FastAPI backend: REST + WebSockets, Claude agents run as asyncio tasks inside this pod"
+spec:
+  # ONE replica by default. The audio hub, STT tee, presence, live-session runtime state and the
+  # agent semaphore are per-process. See docs/DEPLOYMENT.md → "Scaling out" before raising this.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # With a single replica keep the old pod serving until the new one is Ready.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: evently-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: evently-api
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: evently-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          image: ghcr.io/OWNER/evently-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: evently-api-config
+            - secretRef:
+                name: evently-api-secrets
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Merged into the OTel Resource by the SDK; lets Dash0 join traces with k8s metadata and
+            # gives each pod a stable service.instance.id.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.pod.name=$(POD_NAME),k8s.namespace.name=$(POD_NAMESPACE),k8s.node.name=$(NODE_NAME),k8s.deployment.name=evently-api,service.instance.id=$(POD_NAME)"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30 # 90 s for first boot (table creation, Redis + ES connect)
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Let the Ingress controller drop the pod from its endpoints before uvicorn stops accepting;
+              # open WebSockets then get a clean 1001 from the app's shutdown hooks.
+              sleep:
+                seconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          emptyDir: {} # only used when DATABASE_URL falls back to SQLite
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: evently-api
+  labels:
+    app.kubernetes.io/name: evently-api
+    app.kubernetes.io/component: api

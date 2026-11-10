@@ -1,0 +1,32 @@
+# ingress-nginx. One Ingress for everything: with a single API replica no affinity is needed.
+# The `scale-out` component adds a second, hash-routed Ingress for /ws/sessions/* and /ws/events/*.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: evently-api
+  labels:
+    app.kubernetes.io/name: evently-api
+    app.kubernetes.io/component: ingress
+  annotations:
+    # WebSockets: nginx upgrades automatically, but its default 60 s read/send timeouts would cut
+    # idle control sockets and long audio streams. One hour, then clients reconnect with ?since=.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    # SSE (/api/v1/events/{id}/stream) must not be buffered.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Slide HTML + deck exports are a few MB at most.
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.evently.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: evently-api
+                port:
+                  name: http

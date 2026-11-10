@@ -1,0 +1,9 @@
+# Applied separately from the app overlays because these kinds need the Dash0 operator's CRDs.
+# The operator configuration is an *example* (cluster-scoped, one per cluster) — copy it in only
+# when the operator was installed without the `operator.dash0Export.*` Helm values.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - dash0-monitoring.yaml
+  # - dash0-operator-configuration.example.yaml

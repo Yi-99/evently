@@ -1,0 +1,33 @@
+from app.models.tables import (
+    AgentRun,
+    Board,
+    Card,
+    ChatMessage,
+    Edge,
+    EmailMessage,
+    Event,
+    LiveSession,
+    LumaEvent,
+    Participant,
+    Presentation,
+    Slide,
+    TranscriptSegment,
+    User,
+)
+
+__all__ = [
+    "AgentRun",
+    "Board",
+    "Card",
+    "ChatMessage",
+    "Edge",
+    "EmailMessage",
+    "Event",
+    "LiveSession",
+    "LumaEvent",
+    "Participant",
+    "Presentation",
+    "Slide",
+    "TranscriptSegment",
+    "User",
+]

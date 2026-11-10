@@ -1,0 +1,205 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-paper: #ffffff;
+  --color-card: #ffffff;
+  --color-ink: #111827;
+  --color-muted: #6b7280;
+  --color-line: #e5e7eb;
+  --color-accent: #4f46e5;
+  --color-accent-soft: #eef2ff;
+  --color-ok: #4f46e5;
+  --color-ok-soft: #eef2ff;
+  --color-run: #6366f1;
+  --color-run-soft: #e0e7ff;
+  --color-warn: #e11d48;
+  --color-warn-soft: #fff1f2;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Soft pastel aurora behind hero content */
+.glow {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.glow::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  z-index: -1;
+  background:
+    radial-gradient(40% 35% at 18% 30%, rgba(244, 114, 182, 0.18), transparent 70%),
+    radial-gradient(35% 40% at 55% 45%, rgba(56, 189, 248, 0.2), transparent 70%),
+    radial-gradient(40% 40% at 85% 25%, rgba(129, 140, 248, 0.22), transparent 70%),
+    radial-gradient(30% 30% at 70% 85%, rgba(192, 132, 252, 0.14), transparent 70%);
+  filter: blur(40px);
+}
+
+/* React Flow tweaks */
+.react-flow__attribution {
+  display: none;
+}
+.react-flow__edge-path {
+  stroke: #d1d5db;
+  stroke-width: 1.5;
+}
+.react-flow__edge.animated .react-flow__edge-path {
+  stroke: var(--color-run);
+}
+.react-flow__controls {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  border: 1px solid var(--color-line);
+  border-radius: 16px;
+  overflow: hidden;
+}
+.react-flow__controls-button {
+  background: #fff;
+  border-bottom-color: var(--color-line);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: rise 0.45s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* Hero ribbon: slow sway */
+.ribbon-wrap svg {
+  transform-origin: 100% 0;
+  animation: sway 14s ease-in-out infinite alternate;
+}
+@keyframes sway {
+  from {
+    transform: rotate(0deg) scale(1);
+  }
+  to {
+    transform: translate(-24px, 0) rotate(-1.5deg) scale(1.03);
+  }
+}
+
+/* Landing hero: posters drifting around the headline. --r is each tile's resting tilt. */
+.float-tile {
+  transform: rotate(var(--r, 0deg));
+  animation: float-tile 9s ease-in-out infinite alternate;
+}
+@keyframes float-tile {
+  from {
+    transform: translateY(0) rotate(var(--r, 0deg));
+  }
+  to {
+    transform: translateY(-16px) rotate(calc(var(--r, 0deg) * -0.5));
+  }
+}
+/* Closing section: rows of plan cards in an endless loop. Tracks hold their cards twice, so
+   sliding by half returns to the start. Hovering a row pauses it. */
+.loop-track {
+  animation: loop-slide 70s linear infinite;
+}
+.loop-reverse {
+  animation-direction: reverse;
+}
+.loop-row:hover .loop-track {
+  animation-play-state: paused;
+}
+@keyframes loop-slide {
+  to {
+    transform: translateX(-50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ribbon-wrap svg,
+  .float-tile,
+  .loop-track {
+    animation: none;
+  }
+}
+
+/* In-progress step: soft theme gradient that keeps shifting */
+.node-running {
+  background: linear-gradient(120deg, #7dd3fc, #a5b4fc, #c4b5fd, #f0abfc, #f9a8d4, #a5b4fc, #7dd3fc);
+  background-size: 300% 300%;
+  animation: node-shift 3s ease-in-out infinite;
+}
+@keyframes node-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .node-running {
+    animation: none;
+  }
+}
+
+/* Smoothly reflow nodes when one expands or collapses */
+.react-flow__node {
+  transition: transform 0.45s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__node {
+    transition: none;
+  }
+}
+
+/* Landing-page category cards: on hover, a glow in the card's icon color (--glow) that follows the pointer (--x, --y). */
+.category-card::before,
+.category-card::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+.category-card::before {
+  inset: 0;
+  background: radial-gradient(260px circle at var(--x, 50%) var(--y, 110%), color-mix(in srgb, var(--glow) 22%, transparent), transparent 70%);
+}
+/* Edge highlight: a 1px ring masked to the area near the pointer. */
+.category-card::after {
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: radial-gradient(180px circle at var(--x, 50%) var(--y, 110%), var(--glow), transparent 70%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.category-card:hover {
+  box-shadow: 0 12px 32px -12px color-mix(in srgb, var(--glow) 55%, transparent);
+}
+.category-card:hover::before,
+.category-card:hover::after {
+  opacity: 1;
+}

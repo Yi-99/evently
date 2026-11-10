@@ -1,0 +1,31 @@
+# Turns the Dash0 operator on for the `evently` namespace: pod/log collection, k8s resource
+# attributes, workload auto-instrumentation. Apply AFTER the operator is installed (deploy/k8s/dash0
+# is a separate kustomization because the CRD must exist first):
+#
+#   kubectl apply -k deploy/k8s/dash0
+#
+# Interaction with the API's own OpenTelemetry SDK (app/observability/otel.py):
+#   * the operator's Python auto-instrumentation detects an existing SDK, prints a warning and backs
+#     off, so there is no double instrumentation;
+#   * the API sets OTEL_EXPORTER_OTLP_ENDPOINT itself, so the operator leaves it alone and records a
+#     Warning event on the pod — expected, documented in docs/OBSERVABILITY.md.
+# Workloads labelled `dash0.com/enable: "false"` (Redis, Postgres, Elasticsearch) are skipped.
+apiVersion: operator.dash0.com/v1beta1
+kind: Dash0Monitoring
+metadata:
+  name: dash0-monitoring-resource
+  namespace: evently
+spec:
+  instrumentWorkloads:
+    # `all` instruments existing workloads too (restarts pods once); `created-and-updated` waits for the
+    # next rollout; `none` keeps only log/metric collection and resource attributes.
+    mode: all
+    labelSelector: "dash0.com/enable!=false"
+  synchronizePersesDashboards: true
+  synchronizePrometheusRules: true
+  # Drop health-check noise if anything in the namespace is instrumented by the operator rather than
+  # by our SDK (our SDK already excludes /api/v1/health).
+  filter:
+    traces:
+      span:
+        - 'attributes["url.path"] == "/api/v1/health"'

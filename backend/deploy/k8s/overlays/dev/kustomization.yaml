@@ -1,0 +1,85 @@
+# Dev cluster (kind / k3d / Docker Desktop / a shared dev namespace): everything in-cluster,
+# one API pod, auth optional, telemetry to Dash0's `dev` dataset.
+#
+#   kubectl kustomize deploy/k8s/overlays/dev | less
+#   kubectl apply -k deploy/k8s/overlays/dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: evently
+
+resources:
+  - ../../base
+  - postgres.yaml
+  # Elasticsearch is Elastic Cloud (ELASTICSEARCH_URL/KEY come from .env via `task k8s:secrets:dev`).
+  # The in-cluster alternative is elasticsearch.yaml: add it back here plus the ELASTICSEARCH_URL ConfigMap patch.
+
+# Uncomment to try multi-pod routing in dev (read docs/DEPLOYMENT.md → "Scaling out" first).
+# components:
+#   - ../../components/scale-out
+
+images:
+  - name: ghcr.io/OWNER/evently-api
+    newTag: dev
+
+patches:
+  # App settings for dev.
+  - target:
+      kind: ConfigMap
+      name: evently-api-config
+    patch: |-
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: development
+      - op: add
+        path: /data/AUTH_REQUIRED
+        value: "false"
+      - op: replace
+        path: /data/CORS_ORIGINS
+        value: '["http://localhost:3000","http://localhost:5173","http://api.evently.localtest.me"]'
+      - op: replace
+        path: /data/DASH0_DATASET
+        value: default
+      # Dash0 region of your org's token (Settings -> Endpoints); the base default is eu-west-1.
+      - op: replace
+        path: /data/OTEL_EXPORTER_OTLP_ENDPOINT
+        value: https://ingress.us-west-2.aws.dash0.com:4317
+  # In-cluster Postgres (overlays/dev/postgres.yaml) instead of a managed DB.
+  - target:
+      kind: Secret
+      name: evently-api-secrets
+    patch: |-
+      - op: replace
+        path: /stringData/DATABASE_URL
+        value: postgresql+asyncpg://evently:evently-dev-password@evently-postgres:5432/evently
+      - op: replace
+        path: /stringData/SECRET_KEY
+        value: dev-insecure-secret-key-change-me-in-production
+  # *.localtest.me resolves to 127.0.0.1, which suits kind/k3d with ingress-nginx port-forwarded to :80.
+  - target:
+      kind: Ingress
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.evently.localtest.me
+  # Dev pods are small.
+  - target:
+      kind: Deployment
+      name: evently-api
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits: { cpu: "1", memory: 768Mi }
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+      # Kind inherits the host's DNS search domains (e.g. an ISP's). With the default ndots:5 external names
+      # like ingress.<region>.dash0.com are tried against them first, and an ISP wildcard answer sends
+      # Dash0/Elastic traffic to the wrong host. ndots:1 resolves dotted names as-is.
+      - op: add
+        path: /spec/template/spec/dnsConfig
+        value:
+          options:
+            - { name: ndots, value: "1" }

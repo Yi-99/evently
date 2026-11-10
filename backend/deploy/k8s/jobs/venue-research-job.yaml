@@ -1,0 +1,98 @@
+# TEMPLATE — "one card = one pod". A Kubernetes Job that runs exactly one venue-research agent, so
+# Radar's topology shows a pod per whiteboard card. NOT wired to the runtime yet; see the design note
+# in docs/DEPLOYMENT.md → "One agent per pod (Job template)" for what the runtime needs first
+# (a `k8s` AgentRuntime backend + `python -m app.agents.worker`).
+#
+# Render with envsubst (or a controller) and apply:
+#   RUN_ID=run_abc EVENT_ID=evt_123 CARD_ID=card_456 PLACE_ID=ChIJ... IMAGE_TAG=dev \
+#     envsubst < deploy/k8s/jobs/venue-research-job.yaml | kubectl apply -n evently -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agent-venue-research-${RUN_ID}
+  namespace: evently
+  labels:
+    app.kubernetes.io/name: evently-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: evently
+    app: evently
+    evently.dev/agent-kind: venue_research
+    evently.dev/run-id: "${RUN_ID}"
+    evently.dev/event-id: "${EVENT_ID}"
+    evently.dev/card-id: "${CARD_ID}"
+  annotations:
+    evently.dev/description: "Researches one venue candidate and fills one whiteboard card"
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600 # keep the finished pod visible in Radar for 10 min, then clean up
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: evently-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: evently
+        app: evently
+        evently.dev/agent-kind: venue_research
+        evently.dev/run-id: "${RUN_ID}"
+        evently.dev/card-id: "${CARD_ID}"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: evently-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/OWNER/evently-api:${IMAGE_TAG}
+          # Future entrypoint (not implemented): loads the AgentRun row, runs the venue-research coroutine
+          # with a RunContext whose runtime publishes over the Redis bus, then exits 0/1.
+          command: ["python", "-m", "app.agents.worker"]
+          args:
+            - --kind=venue_research
+            - --run-id=${RUN_ID}
+          envFrom:
+            - configMapRef:
+                name: evently-api-config
+            - secretRef:
+                name: evently-api-secrets
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: evently-agent
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.pod.name=$(POD_NAME),k8s.namespace.name=evently,k8s.job.name=agent-venue-research-${RUN_ID},service.instance.id=$(POD_NAME)"
+            # Continue the parent trace started by the orchestrator's `agent.run` span.
+            - name: TRACEPARENT
+              value: "${TRACEPARENT}"
+            - name: EVENTLY_EVENT_ID
+              value: "${EVENT_ID}"
+            - name: EVENTLY_CARD_ID
+              value: "${CARD_ID}"
+            - name: EVENTLY_PLACE_ID
+              value: "${PLACE_ID}"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

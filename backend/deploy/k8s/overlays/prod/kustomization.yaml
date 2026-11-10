@@ -1,0 +1,61 @@
+# Production: one API pod (see docs/DEPLOYMENT.md → "Scaling out" to opt into more), managed Postgres
+# via DATABASE_URL, Elastic Cloud / ECK via ELASTICSEARCH_URL, TLS through cert-manager, Dash0 `default`
+# dataset. The Secret must come from your secret manager — the base template is placeholders only.
+#
+#   kubectl kustomize deploy/k8s/overlays/prod | less
+#   kubectl apply -k deploy/k8s/overlays/prod
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: evently
+
+resources:
+  - ../../base
+
+# components:
+#   - ../../components/scale-out   # opt-in; finish the "Scaling out" checklist first
+
+images:
+  - name: ghcr.io/OWNER/evently-api
+    newTag: v0.1.0 # pin a release tag or a sha-<commit> tag pushed by CI; never `latest` in prod
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: evently-api-config
+    patch: |-
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: production
+      - op: add
+        path: /data/AUTH_REQUIRED
+        value: "true"
+      - op: replace
+        path: /data/OTEL_TRACES_SAMPLER_ARG
+        value: "0.25"   # 25 % of HTTP request traces; agent.run/llm.request spans follow their parent
+  - target:
+      kind: Ingress
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.evently.example
+      - op: add
+        path: /metadata/annotations/cert-manager.io~1cluster-issuer
+        value: letsencrypt-prod
+      - op: add
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1ssl-redirect
+        value: "true"
+      - op: add
+        path: /spec/tls
+        value:
+          - hosts: [api.evently.example]
+            secretName: evently-api-tls
+  - target:
+      kind: Deployment
+      name: evently-api
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: { cpu: 500m, memory: 768Mi }
+          limits: { cpu: "2", memory: 1536Mi }

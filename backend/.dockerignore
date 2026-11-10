@@ -1,0 +1,38 @@
+# Keep the build context to pyproject.toml + app/.
+.git
+.github
+.gitignore
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+htmlcov
+.coverage
+coverage.xml
+ruff-report.json
+
+# Local data and secrets
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Not needed inside the image
+tests
+docs
+deploy
+examples
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+sonar-project.properties
+.gitar

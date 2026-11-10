@@ -1,0 +1,11 @@
+{
+  "name": "@evently/api-types-gen",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Isolated openapi-typescript toolchain. openapi-typescript needs the TypeScript 5 JS API, which TypeScript 7 (the app compiler) no longer ships, so it lives here with its own TypeScript 5.",
+  "type": "module",
+  "dependencies": {
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5.9.3"
+  }
+}

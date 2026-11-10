@@ -1,0 +1,138 @@
+# Local development stack: API + Postgres + Redis + Elasticsearch + OpenTelemetry Collector → Dash0.
+#
+#   cp .env.example .env            # then fill ANTHROPIC_API_KEY etc.
+#   docker compose up --build       # API on http://localhost:8000, docs on /docs
+#   docker compose --profile tools up kibana   # optional Kibana on :5601
+#
+# Everything the API needs from `.env` is loaded as-is; the `environment:` block below overrides the
+# infrastructure URLs so the containers talk to each other. Dash0 export is driven by these `.env` keys
+# (all optional — without them the collector still receives telemetry and logs a summary, and the
+# export to Dash0 fails quietly in the collector's logs):
+#
+#   DASH0_ENDPOINT=ingress.<region>.<cloud>.dash0.com:4317
+#   DASH0_AUTH_TOKEN=auth_...
+#   DASH0_DATASET=dev
+#
+# Scaling note: exactly one `api` container (one uvicorn worker). See docs/DEPLOYMENT.md → "Scaling out".
+
+name: evently
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: evently-api:dev
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+asyncpg://evently:evently@postgres:5432/evently
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      CORS_ORIGINS: '["http://localhost:3000","http://localhost:5173","http://localhost:8000"]'
+      OTEL_ENABLED: "true"
+      OTEL_SERVICE_NAME: evently-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_HEADERS: ""  # auth happens in the collector, not in the app
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=development,service.instance.id=compose-api
+      DASH0_DATASET: ${DASH0_DATASET:-dev}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: evently
+      POSTGRES_PASSWORD: evently
+      POSTGRES_DB: evently
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evently -d evently"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.144.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      DASH0_ENDPOINT: ${DASH0_ENDPOINT:-ingress.eu-west-1.aws.dash0.com:4317}
+      DASH0_AUTH_TOKEN: ${DASH0_AUTH_TOKEN:-}
+      DASH0_DATASET: ${DASH0_DATASET:-dev}
+    volumes:
+      - ./deploy/otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+      # Lets the `docker` resource detector label telemetry with container metadata (optional).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (also handy for local tools)
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health_check extension
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.1.0
+    profiles: ["tools"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  es-data:

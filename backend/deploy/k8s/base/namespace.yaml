@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: evently
+  labels:
+    app.kubernetes.io/part-of: evently
+    # Dash0 operator: `autoMonitorNamespaces.labelSelector` can key on this when enabled in the
+    # operator configuration; otherwise deploy/k8s/dash0 applies a Dash0Monitoring resource here.
+    dash0.com/enable: "true"
